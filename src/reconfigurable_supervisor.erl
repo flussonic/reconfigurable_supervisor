@@ -765,15 +765,15 @@ reload_childspec1({[],OldDb}, {Ids,Db}, KeepOld) ->
     %% Return them in (kept) reverse start order.
     {lists:reverse(Ids ++ KeepOld),maps:merge(KeepOldDb,Db)}.
 
-reload_chsp(#child{id=Id, pid=Pid, shutdown=Shutdown, mfargs = {_,_,OldArgs}}=OldChild, NewDb) ->
+reload_chsp(#child{id=Id, pid=Pid, shutdown=Shutdown}=OldChild, NewDb) ->
     case maps:find(Id, NewDb) of
-        {ok,#child{mfargs = {_,_,NewArgs}} = Child} when is_pid(Pid) andalso OldArgs =/= NewArgs ->
+        {ok,#child{mfargs = {_,_,Args}} = Child} when is_pid(Pid) ->
             Timeout = case Shutdown of
                 infinity -> infinity;
                 _ when is_integer(Shutdown) -> Shutdown;
                 _ -> 5000
             end,
-            try gen_server:call(Pid, {update_start_args, NewArgs}, Timeout)
+            try gen_server:call(Pid, {update_start_args, Args}, Timeout)
             catch
                 _:_ -> shutdown(Pid, Shutdown)
             end,
