@@ -1,0 +1,9 @@
+{application, reconfigurable_supervisor,
+ [
+  {description, "reconfigurable_supervisor"},
+  {vsn, "21.05.1"},
+  {registered, []},
+  {applications, [kernel,stdlib]},
+  {modules, [reconfigurable_supervisor]},
+  {env, []}
+ ]}.
