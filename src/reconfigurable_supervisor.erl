@@ -17,13 +17,14 @@
 %%
 %% %CopyrightEnd%
 %%
--module(supervisor).
+-module(reconfigurable_supervisor).
 
 -behaviour(gen_server).
 
 %% External exports
 -export([start_link/2, start_link/3,
 	 start_child/2, restart_child/2,
+         reload_specs/1,
 	 delete_child/2, terminate_child/2,
 	 which_children/1, count_children/1,
 	 check_childspecs/1, get_childspec/2]).
@@ -35,7 +36,7 @@
 %% For release_handler only
 -export([get_callback_module/1]).
 
--include("logger.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -define(report_error(Error, Reason, Child, SupName),
         ?LOG_ERROR(#{label=>{supervisor,Error},
@@ -158,14 +159,14 @@
       Module :: module(),
       Args :: term().
 start_link(Mod, Args) ->
-    gen_server:start_link(supervisor, {self, Mod, Args}, []).
+    gen_server:start_link(?MODULE, {self, Mod, Args}, []).
  
 -spec start_link(SupName, Module, Args) -> startlink_ret() when
       SupName :: sup_name(),
       Module :: module(),
       Args :: term().
 start_link(SupName, Mod, Args) ->
-    gen_server:start_link(SupName, supervisor, {SupName, Mod, Args}, []).
+    gen_server:start_link(SupName, ?MODULE, {SupName, Mod, Args}, []).
  
 %%% ---------------------------------------------------
 %%% Interface functions.
@@ -201,6 +202,13 @@ restart_child(Supervisor, Id) ->
       Error :: 'running' | 'restarting' | 'not_found' | 'simple_one_for_one'.
 delete_child(Supervisor, Id) ->
     call(Supervisor, {delete_child, Id}).
+
+-spec reload_specs(SupRef) -> Result when
+      SupRef :: sup_ref(),
+      Result :: 'ok' | {'error', Error},
+      Error :: 'simple_one_for_one'.
+reload_specs(Supervisor) ->
+    call(Supervisor, reload_specs).
 
 %%-----------------------------------------------------------------
 %% Func: terminate_child/2
@@ -360,6 +368,11 @@ start_children(Children, SupName) ->
         end,
     children_map(Start,Children).
 
+
+% this first clause is required for reloading configuration
+do_start_child(_, #child{pid = Pid}) when is_pid(Pid) ->
+    {ok, Pid};
+
 do_start_child(SupName, Child) ->
     #child{mfargs = {M, F, Args}} = Child,
     case do_start_child_i(M, F, Args) of
@@ -422,6 +435,35 @@ handle_call({start_child, ChildSpec}, _From, State) ->
 	What ->
 	    {reply, {error, What}, State}
     end;
+
+handle_call(reload_specs, _From, State) when ?is_simple(State) ->
+    {reply, {error, simple_one_for_one}, State};
+
+handle_call(reload_specs, _From, State) ->
+    #state{module = Mod, args = Args} = State,
+    case reload_specs0(Args, State) of
+        {ok, State1} ->
+                {reply, ok, State1};
+        {error, Error} ->
+                {stop, {bad_return, {Mod, init, Error}}, State}
+    end;    
+
+
+handle_call({update_start_args, _}, _From, State) when ?is_simple(State) ->
+    {reply, {error, simple_one_for_one}, State};
+
+handle_call({update_start_args, StartArgs}, _From, State) ->
+    Args = case StartArgs of
+        [_,_,Args0] -> Args0;
+        [_,Args0] -> Args0
+    end,
+    #state{module = Mod} = State,
+    case reload_specs0(Args, State) of
+        {ok, State1} ->
+                {reply, ok, State1};
+        {error, Error} ->
+                {stop, {bad_return, {Mod, init, Error}}, State}
+    end;    
 
 %% terminate_child for simple_one_for_one can only be done with pid
 handle_call({terminate_child, Id}, _From, State) when not is_pid(Id),
@@ -623,6 +665,7 @@ code_change(_, State, _) ->
 	    Error
     end.
 
+
 update_childspec(State, StartSpec) when ?is_simple(State) ->
     case check_startspec(StartSpec) of
         {ok, {[_],_}=Children} ->
@@ -659,6 +702,93 @@ update_chsp(#child{id=Id}=OldChild, NewDb) ->
         error -> % Id not found in new spec.
             false
     end.
+
+
+
+
+
+
+
+reload_specs0(Args, State) ->
+    case (State#state.module):init(Args) of
+        {ok, {SupFlags, StartSpec}} ->
+            case set_flags(SupFlags, State#state{args = Args}) of
+                {ok, State1}  ->
+                    reload_childspec(State1, StartSpec);
+                {invalid_type, SupFlags} ->
+                    {error, {bad_flags, SupFlags}}; % backwards compatibility
+                Error ->
+                    {error, Error}
+            end;
+        ignore ->
+            {ok, State#state{args = Args}};
+        Error ->
+            Error
+    end.
+
+
+reload_childspec(State, StartSpec) when ?is_simple(State) ->
+    case check_startspec(StartSpec) of
+        {ok, {[_],_}=Children} ->
+            {ok, State#state{children = Children}};
+        Error ->
+            {error, Error}
+    end;
+reload_childspec(State, StartSpec) ->
+    case check_startspec(StartSpec) of
+        {ok, Children} ->
+            OldC = State#state.children, % In reverse start order !
+            NewC = reload_childspec1(OldC, Children, []),
+            case start_children(NewC, State#state.name) of
+                {ok, NChildren} ->
+                    {ok, State#state{children = NChildren}};
+                {error, NChildren, Reason} ->
+                    _ = terminate_children(NChildren, State#state.name),
+                    {error, {shutdown, Reason}}
+            end;
+        Error ->
+            {error, Error}
+    end.
+
+            
+
+
+reload_childspec1({[Id|OldIds], OldDb}, {Ids,Db}, KeepOld) ->
+    case reload_chsp(maps:get(Id,OldDb), Db) of
+        {ok,NewDb} ->
+            reload_childspec1({OldIds,OldDb}, {Ids,NewDb}, KeepOld);
+        false ->
+            reload_childspec1({OldIds,OldDb}, {Ids,Db}, [Id|KeepOld])
+    end;
+reload_childspec1({[],OldDb}, {Ids,Db}, KeepOld) ->
+    KeepOldDb = maps:with(KeepOld,OldDb),
+    %% Return them in (kept) reverse start order.
+    {lists:reverse(Ids ++ KeepOld),maps:merge(KeepOldDb,Db)}.
+
+reload_chsp(#child{id=Id, pid=Pid, shutdown=Shutdown, mfargs = {_,_,OldArgs}}=OldChild, NewDb) ->
+    case maps:find(Id, NewDb) of
+        {ok,#child{mfargs = {_,_,NewArgs}} = Child} when is_pid(Pid) andalso OldArgs =/= NewArgs ->
+            Timeout = case Shutdown of
+                infinity -> infinity;
+                _ when is_integer(Shutdown) -> Shutdown;
+                _ -> 5000
+            end,
+            try gen_server:call(Pid, {update_start_args, NewArgs}, Timeout)
+            catch
+                _:_ -> shutdown(Pid, Shutdown)
+            end,
+            {ok,NewDb#{Id => Child#child{pid = OldChild#child.pid}}};
+        {ok,Child} ->
+            {ok,NewDb#{Id => Child#child{pid = OldChild#child.pid}}};
+        error when is_pid(Pid) -> % Id not found in new spec.
+            shutdown(Pid, Shutdown),
+            {ok,maps:remove(Id,NewDb)};
+        error -> % Id not found in new spec.
+            {ok,maps:remove(Id,NewDb)}
+    end.
+
+
+
 
     
 %%% ---------------------------------------------------
